@@ -1,0 +1,25 @@
+﻿date,region,channel,product_line,sales,units_sold,logistics_cost,returns,warehouse_utilization
+2024-01-01,North,Online,Electronics,125000,820,18200,22,71
+2024-02-01,South,Retail,Home Goods,118500,790,17950,18,69
+2024-03-01,West,Distributor,Industrial,132400,845,18820,24,73
+2024-04-01,East,Online,Electronics,129900,838,19100,21,74
+2024-05-01,North,Retail,Home Goods,136800,860,19650,19,75
+2024-06-01,South,Online,Electronics,141500,874,20120,26,76
+2024-07-01,West,Distributor,Industrial,145900,892,20580,25,77
+2024-08-01,East,Retail,Home Goods,138200,868,20840,20,78
+2024-09-01,North,Online,Electronics,149600,905,21200,27,79
+2024-10-01,South,Distributor,Industrial,154200,916,21850,23,80
+2024-11-01,West,Online,Electronics,158900,928,22410,28,81
+2024-12-01,East,Retail,Home Goods,165300,944,22980,24,82
+2025-01-01,North,Distributor,Industrial,168500,956,23440,25,82
+2025-02-01,South,Online,Electronics,172800,968,23890,29,83
+2025-03-01,West,Retail,Home Goods,176400,975,24450,26,83
+2025-04-01,East,Distributor,Industrial,181900,992,24920,30,84
+2025-05-01,North,Online,Electronics,185600,1004,25580,27,85
+2025-06-01,South,Retail,Home Goods,189300,1018,26140,31,85
+2025-07-01,West,Distributor,Industrial,194800,1032,26820,29,86
+2025-08-01,East,Online,Electronics,201400,1054,27390,34,87
+2025-09-01,North,Retail,Home Goods,289500,1260,33200,52,91
+2025-10-01,South,Distributor,Industrial,209800,1081,28440,32,88
+2025-11-01,West,Online,Electronics,215600,1098,29120,35,89
+2025-12-01,East,Retail,Home Goods,223900,1120,29880,33,90
