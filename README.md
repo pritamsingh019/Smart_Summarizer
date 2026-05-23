@@ -1,4 +1,4 @@
-# Smart Summariser
+# Smart Summarizer
 
 ## Overview
 
