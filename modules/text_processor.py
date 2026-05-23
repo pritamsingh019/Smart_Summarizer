@@ -227,24 +227,55 @@ def _summarize_text(text: str, sentence_count: int = 5, logger=None) -> str:
 # ENTITY EXTRACTION
 # ──────────────────────────────────────────────────────────────────
 
-def _extract_entities(text: str, nlp, logger=None) -> list[dict]:
+_NER_CATEGORIES = {"PERSON", "ORG", "GPE", "DATE", "MONEY"}
+
+
+def _extract_entities(text: str, nlp, logger=None) -> dict[str, list[dict]]:
+    """
+    Extract named entities from text using spaCy, filtered to five categories.
+
+    Parameters
+    ----------
+    text   : str
+        Raw document text.
+    nlp    : spacy.lang.en.English or None
+        Loaded spaCy model.  If ``None``, returns empty structure.
+    logger : logging.Logger, optional
+        Logger instance.
+
+    Returns
+    -------
+    dict[str, list[dict]]
+        Keys are entity categories (PERSON, ORG, GPE, DATE, MONEY).
+        Values are lists of dicts with keys ``text`` and ``count``,
+        sorted by count descending.  Missing categories are present
+        as empty lists.
+    """
     if nlp is None:
-        return []
+        return {cat: [] for cat in _NER_CATEGORIES}
     logger = logger or get_logger(__name__)
     counts: Counter = Counter()
     try:
         for chunk in chunk_text(text, chunk_size=20_000):
             doc = nlp(chunk)
             for ent in doc.ents:
+                if ent.label_ not in _NER_CATEGORIES:
+                    continue
                 cleaned = compact_text(ent.text)
                 if len(cleaned) < 2:
                     continue
                 counts[(cleaned, ent.label_)] += 1
     except Exception as exc:
         logger.warning("Entity extraction failed: %s", exc)
-        return []
-    ranked = sorted(counts.items(), key=lambda x: (-x[1], x[0][0]))
-    return [{"text": t, "label": l, "count": int(c)} for (t, l), c in ranked[:20]]
+        return {cat: [] for cat in _NER_CATEGORIES}
+
+    # Group by category, sorted by count descending within each
+    grouped: dict[str, list[dict]] = {cat: [] for cat in _NER_CATEGORIES}
+    for (text_val, label), count in counts.items():
+        grouped[label].append({"text": text_val, "count": int(count)})
+    for cat in grouped:
+        grouped[cat].sort(key=lambda x: (-x["count"], x["text"]))
+    return grouped
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -297,7 +328,7 @@ def process_text(text: str, nlp=None, depth: int = 3, logger=None) -> dict:
         "keywords": [],
         "keyword_importance": {},   # NEW: term → importance (0–1) lookup
         "summary": "",
-        "entities": [],
+        "entities": {},
         "keyword_contexts": {},
         "chunk_count": 0,
         "error": None,

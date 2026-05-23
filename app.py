@@ -1,3 +1,32 @@
+"""
+app.py
+──────
+Smart Summariser — Streamlit dashboard.
+
+Presentation-layer complete rewrite.  All backend pipeline / orchestrator
+calls are preserved verbatim.  Only the rendering layer changes.
+
+Architecture
+────────────
+main()
+  ├── inject_global_css(theme)     — injects CSS vars + static stylesheet
+  ├── [no file] → render_landing(theme)
+  │       ├── render_top_bar(theme)
+  │       ├── render_hero()
+  │       ├── render_upload_card()
+  │       └── render_feature_cards()
+  └── [file uploaded] → render_dashboard(theme, results, …)
+          ├── render_top_bar(theme)
+          ├── render_kpi_row(results)
+          ├── render_charts_grid(results, theme)
+          └── render_insights_list(results, has_nlp_text_upload)
+
+Sidebar is wired inside main() via st.sidebar.
+"""
+
+from __future__ import annotations
+
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -5,388 +34,193 @@ import streamlit as st
 
 from utils.helpers import format_metric, humanize_label, infer_file_type
 from utils.logger import get_logger
+from utils.theme import get_theme
 
 LOGGER = get_logger("smart_summariser.app")
-PROJECT_ROOT = Path(__file__).resolve().parent
-SAMPLE_DATA_PATH = PROJECT_ROOT / "sample_data" / "example_sales.csv"
+PROJECT_ROOT      = Path(__file__).resolve().parent
+CSS_PATH          = PROJECT_ROOT / "assets" / "styles.css"
+SAMPLE_DATA_PATH  = PROJECT_ROOT / "sample_data" / "example_sales.csv"
 STRUCTURED_FILE_TYPES = {"csv", "excel"}
-TEXT_FILE_TYPES = {"pdf", "txt"}
-DEFAULT_SPACY_MODEL = "en_core_web_sm"
+TEXT_FILE_TYPES       = {"pdf", "txt"}
+DEFAULT_SPACY_MODEL   = "en_core_web_sm"
 
-st.set_page_config(page_title="Smart Summariser", layout="centered", page_icon="📊")
+st.set_page_config(
+    page_title="Smart Summariser",
+    layout="wide",
+    page_icon="📊",
+    initial_sidebar_state="expanded",
+)
+
+# ─────────────────────────────────────────────────────────────────
+# CSS INJECTION
+# ─────────────────────────────────────────────────────────────────
+
+_STATIC_CSS: str | None = None   # module-level cache
+
+
+def _load_static_css() -> str:
+    """Load assets/styles.css once and cache the result in memory.
+
+    Returns
+    -------
+    str
+        Raw CSS content, or empty string if the file cannot be read.
+    """
+    global _STATIC_CSS
+    if _STATIC_CSS is None:
+        try:
+            _STATIC_CSS = CSS_PATH.read_text(encoding="utf-8")
+        except Exception as exc:
+            LOGGER.warning("Could not load assets/styles.css: %s", exc)
+            _STATIC_CSS = ""
+    return _STATIC_CSS
+
+
+def inject_global_css(theme: dict) -> None:
+    """Inject the static stylesheet and the theme's CSS custom properties.
+
+    Calls ``st.markdown`` twice:
+
+    1. The full contents of ``assets/styles.css`` wrapped in ``<style>``.
+    2. A ``<style>`` block that sets CSS custom properties on ``html``
+       derived from *theme* (bg, text, border, accent).
+
+    Parameters
+    ----------
+    theme : dict
+        Design-token dict returned by :func:`utils.theme.get_theme`.
+    """
+    static = _load_static_css()
+    if static:
+        st.markdown(f"<style>{static}</style>", unsafe_allow_html=True)
+
+    # Dynamic colour custom properties
+    st.markdown(f"""
+<style>
+html {{
+    --bg-primary:    {theme['bg_primary']};
+    --bg-secondary:  {theme['bg_secondary']};
+    --text-primary:  {theme['text_primary']};
+    --text-secondary:{theme['text_secondary']};
+    --border:        {theme['border']};
+    --accent:        {theme['accent']};
+    --accent-text:   {theme['accent_text']};
+}}
+body, .stApp, .stApp > .main {{
+    background: var(--bg-primary) !important;
+}}
+</style>
+""", unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────────────────────
-# STYLES
+# SVG ICONS  (inline, no CDN)
 # ─────────────────────────────────────────────────────────────────
 
-def inject_styles() -> None:
+_SUN_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" '
+    'viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+    '<circle cx="12" cy="12" r="4"/>'
+    '<line x1="12" y1="2"  x2="12" y2="6"/>'
+    '<line x1="12" y1="18" x2="12" y2="22"/>'
+    '<line x1="4.93"  y1="4.93"  x2="7.76"  y2="7.76"/>'
+    '<line x1="16.24" y1="16.24" x2="19.07" y2="19.07"/>'
+    '<line x1="2"  y1="12" x2="6"  y2="12"/>'
+    '<line x1="18" y1="12" x2="22" y2="12"/>'
+    '<line x1="4.93"  y1="19.07" x2="7.76"  y2="16.24"/>'
+    '<line x1="16.24" y1="7.76"  x2="19.07" y2="4.93"/>'
+    '</svg>'
+)
+
+_MOON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" '
+    'viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+    '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>'
+    '</svg>'
+)
+
+
+# ─────────────────────────────────────────────────────────────────
+# SHARED HELPERS
+# ─────────────────────────────────────────────────────────────────
+
+_TAIL_SENTINEL = "This sustained"
+
+
+def strip_templated_prose(description: str) -> str:
+    """Remove the boilerplate tail from trend insight descriptions.
+
+    Splits on the sentinel string ``"This sustained"``, takes the text
+    before it, and strips trailing whitespace / punctuation.  Does not
+    modify ``insight_generator.py``.
+
+    Parameters
+    ----------
+    description : str
+        Raw description string from the insight generator.
+
+    Returns
+    -------
+    str
+        Cleaned description, or the original string if the sentinel is
+        absent.
+    """
+    if _TAIL_SENTINEL in description:
+        description = description.split(_TAIL_SENTINEL)[0].rstrip(" .,;")
+    return description
+
+
+def _empty_state(icon: str, title: str, sub: str = "") -> None:
+    """Render a centred, bordered empty-state card.
+
+    Parameters
+    ----------
+    icon  : str
+        Emoji or short text used as the visual anchor.
+    title : str
+        Short bold headline (serif italic in CSS).
+    sub   : str, optional
+        Secondary body text (smaller, text-secondary colour).
+    """
     st.markdown(
-        """
-        <style>
-            @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
-
-            html, body, [class*="css"] {
-                font-family: 'Inter', 'Segoe UI', sans-serif;
-            }
-            .stApp {
-                background: #0E1117;
-                color: #E6EDF3;
-            }
-
-            /* Scrollbar */
-            ::-webkit-scrollbar { width: 6px; height: 6px; }
-            ::-webkit-scrollbar-track { background: #0E1117; }
-            ::-webkit-scrollbar-thumb { background: rgba(0,194,255,0.25); border-radius: 999px; }
-            ::-webkit-scrollbar-thumb:hover { background: rgba(0,194,255,0.45); }
-
-            /* Sidebar */
-            [data-testid="stSidebar"] {
-                background: #0D1119;
-                border-right: 1px solid rgba(255,255,255,0.06);
-            }
-
-            /* Section header */
-            .section-label {
-                color: #00C2FF;
-                font-size: 0.70rem;
-                letter-spacing: 0.14em;
-                text-transform: uppercase;
-                font-weight: 700;
-                margin-bottom: 0.3rem;
-            }
-            .section-title {
-                color: #E6EDF3;
-                font-size: 1.15rem;
-                font-weight: 700;
-                margin-bottom: 0.7rem;
-                border-bottom: 1px solid rgba(255,255,255,0.07);
-                padding-bottom: 0.45rem;
-            }
-
-            /* Summary card row */
-            .summary-row {
-                display: flex;
-                gap: 1rem;
-                margin-bottom: 1.5rem;
-                flex-wrap: wrap;
-            }
-            .summary-card {
-                flex: 1;
-                min-width: 120px;
-                background: linear-gradient(160deg, rgba(30,36,50,0.98), rgba(19,24,35,0.97));
-                border: 1px solid rgba(255,255,255,0.08);
-                border-radius: 16px;
-                padding: 1.0rem 1.1rem;
-                text-align: center;
-            }
-            .summary-card-label {
-                color: #7B8899;
-                font-size: 0.72rem;
-                letter-spacing: 0.09em;
-                text-transform: uppercase;
-                font-weight: 600;
-                margin-bottom: 0.4rem;
-            }
-            .summary-card-value {
-                color: #E6EDF3;
-                font-size: 1.8rem;
-                font-weight: 800;
-                line-height: 1.1;
-                letter-spacing: -0.02em;
-            }
-            .summary-card-sub {
-                color: #8B9AAA;
-                font-size: 0.78rem;
-                margin-top: 0.3rem;
-            }
-
-            /* Structured data summary table */
-            .col-summary-table {
-                width: 100%;
-                border-collapse: collapse;
-                margin-bottom: 1.2rem;
-                font-size: 0.88rem;
-            }
-            .col-summary-table th {
-                background: rgba(0,194,255,0.10);
-                color: #00C2FF;
-                font-size: 0.72rem;
-                letter-spacing: 0.10em;
-                text-transform: uppercase;
-                font-weight: 700;
-                padding: 0.55rem 0.9rem;
-                text-align: left;
-                border-bottom: 1px solid rgba(0,194,255,0.15);
-            }
-            .col-summary-table td {
-                padding: 0.50rem 0.9rem;
-                color: #CBD5E1;
-                border-bottom: 1px solid rgba(255,255,255,0.05);
-                vertical-align: top;
-                line-height: 1.55;
-            }
-            .col-summary-table tr:hover td {
-                background: rgba(255,255,255,0.025);
-            }
-            .col-name {
-                color: #E6EDF3;
-                font-weight: 600;
-            }
-            .col-type-badge {
-                display: inline-block;
-                padding: 0.10rem 0.50rem;
-                border-radius: 999px;
-                font-size: 0.68rem;
-                font-weight: 700;
-                letter-spacing: 0.05em;
-                text-transform: uppercase;
-            }
-            .badge-numeric  { background: rgba(52,211,153,0.12); color: #34D399; border: 1px solid rgba(52,211,153,0.25); }
-            .badge-category { background: rgba(0,194,255,0.10);  color: #00C2FF; border: 1px solid rgba(0,194,255,0.20); }
-            .badge-datetime { background: rgba(245,158,11,0.10); color: #F59E0B; border: 1px solid rgba(245,158,11,0.25); }
-
-            /* Chart wrapper */
-            .chart-wrap {
-                background: rgba(26,31,43,0.7);
-                border: 1px solid rgba(255,255,255,0.065);
-                border-radius: 16px;
-                padding: 0.6rem 0.8rem 0.2rem;
-                margin-bottom: 1.1rem;
-            }
-
-            /* Insight item (legacy) */
-            .insight-item {
-                background: rgba(0,194,255,0.05);
-                border-left: 3px solid #00C2FF;
-                border-radius: 0 8px 8px 0;
-                padding: 0.65rem 0.95rem;
-                margin-bottom: 0.65rem;
-                color: #CBD5E1;
-                font-size: 0.91rem;
-                line-height: 1.68;
-            }
-            .insight-title {
-                color: #E6EDF3;
-                font-weight: 700;
-                margin-bottom: 0.15rem;
-                font-size: 0.82rem;
-                letter-spacing: 0.04em;
-                text-transform: uppercase;
-            }
-
-            /* ── Ranked Insight Cards ── */
-            .ri-card {
-                background: linear-gradient(160deg, rgba(20,26,38,0.98), rgba(14,19,28,0.97));
-                border: 1px solid rgba(255,255,255,0.07);
-                border-radius: 14px;
-                padding: 1.0rem 1.15rem 0.85rem;
-                margin-bottom: 0.95rem;
-                position: relative;
-                transition: border-color 0.2s;
-            }
-            .ri-card:hover { border-color: rgba(0,194,255,0.25); }
-            .ri-header {
-                display: flex;
-                align-items: flex-start;
-                gap: 0.7rem;
-                margin-bottom: 0.55rem;
-            }
-            .ri-rank {
-                font-size: 1.35rem;
-                line-height: 1;
-                flex-shrink: 0;
-                margin-top: 0.05rem;
-            }
-            .ri-title-block { flex: 1; min-width: 0; }
-            .ri-title {
-                color: #E6EDF3;
-                font-size: 0.93rem;
-                font-weight: 700;
-                letter-spacing: 0.03em;
-                margin-bottom: 0.25rem;
-                white-space: nowrap;
-                overflow: hidden;
-                text-overflow: ellipsis;
-            }
-            .ri-badges { display: flex; gap: 0.4rem; flex-wrap: wrap; }
-            .ri-badge {
-                display: inline-block;
-                padding: 0.08rem 0.55rem;
-                border-radius: 999px;
-                font-size: 0.64rem;
-                font-weight: 800;
-                letter-spacing: 0.09em;
-                text-transform: uppercase;
-            }
-            .badge-data    { background: rgba(52,211,153,0.12); color: #34D399; border: 1px solid rgba(52,211,153,0.25); }
-            .badge-text    { background: rgba(0,194,255,0.10);  color: #00C2FF; border: 1px solid rgba(0,194,255,0.22); }
-            .badge-fusion  { background: rgba(167,139,250,0.12); color: #A78BFA; border: 1px solid rgba(167,139,250,0.25); }
-            .badge-anomaly { background: rgba(251,113,133,0.12); color: #FB7185; border: 1px solid rgba(251,113,133,0.25); }
-            .ri-score-wrap {
-                display: flex;
-                align-items: center;
-                gap: 0.6rem;
-                margin-bottom: 0.6rem;
-            }
-            .ri-score-bar-bg {
-                flex: 1;
-                height: 4px;
-                background: rgba(255,255,255,0.07);
-                border-radius: 999px;
-                overflow: hidden;
-            }
-            .ri-score-bar-fill {
-                height: 100%;
-                border-radius: 999px;
-                background: linear-gradient(90deg, #0099CC, #00C2FF);
-                transition: width 0.5s;
-            }
-            .ri-score-label {
-                color: #7B8899;
-                font-size: 0.68rem;
-                font-weight: 700;
-                white-space: nowrap;
-            }
-            .ri-description {
-                color: #B8C4D0;
-                font-size: 0.89rem;
-                line-height: 1.72;
-                margin-bottom: 0.5rem;
-            }
-            .ri-evidence {
-                margin-top: 0.45rem;
-                display: flex;
-                flex-wrap: wrap;
-                gap: 0.35rem;
-            }
-            .ri-ev-chip {
-                background: rgba(255,255,255,0.04);
-                border: 1px solid rgba(255,255,255,0.09);
-                border-radius: 8px;
-                padding: 0.15rem 0.6rem;
-                font-size: 0.74rem;
-                color: #8B9AAA;
-                font-family: 'Courier New', monospace;
-            }
-            .ri-fusion-matches {
-                background: rgba(167,139,250,0.06);
-                border: 1px solid rgba(167,139,250,0.15);
-                border-radius: 10px;
-                padding: 0.65rem 0.85rem;
-                margin-top: 0.5rem;
-            }
-            .ri-match-title {
-                color: #A78BFA;
-                font-size: 0.71rem;
-                font-weight: 700;
-                letter-spacing: 0.10em;
-                text-transform: uppercase;
-                margin-bottom: 0.4rem;
-            }
-            .ri-match-pill {
-                display: inline-block;
-                background: rgba(167,139,250,0.10);
-                border: 1px solid rgba(167,139,250,0.20);
-                border-radius: 999px;
-                padding: 0.12rem 0.55rem;
-                font-size: 0.73rem;
-                color: #C4B5FD;
-                margin: 2px;
-            }
-
-            /* Text fallback box */
-            .text-summary-box {
-                background: linear-gradient(160deg, rgba(26,31,43,0.98), rgba(19,24,35,0.97));
-                border: 1px solid rgba(0,194,255,0.15);
-                border-radius: 16px;
-                padding: 1.2rem 1.3rem;
-                margin-bottom: 1.2rem;
-            }
-            .text-summary-title {
-                color: #00C2FF;
-                font-size: 0.78rem;
-                letter-spacing: 0.10em;
-                text-transform: uppercase;
-                font-weight: 700;
-                margin-bottom: 0.55rem;
-            }
-            .text-summary-body {
-                color: #CED8E2;
-                font-size: 0.92rem;
-                line-height: 1.72;
-            }
-
-            /* Empty state */
-            .empty-state {
-                background: rgba(26,31,43,0.6);
-                border: 1px dashed rgba(255,255,255,0.10);
-                border-radius: 16px;
-                padding: 2.5rem 1.5rem;
-                color: #6B7785;
-                text-align: center;
-                font-size: 0.92rem;
-                line-height: 1.65;
-            }
-            .empty-state-icon {
-                font-size: 2.5rem;
-                margin-bottom: 0.7rem;
-                opacity: 0.55;
-            }
-
-            /* Overrides */
-            div[data-testid="stMetric"] {
-                background: rgba(26,31,43,0.7);
-                border: 1px solid rgba(255,255,255,0.07);
-                border-radius: 14px;
-                padding: 0.75rem 1rem;
-            }
-            .stDataFrame { border-radius: 12px; overflow: hidden; }
-            .stExpander { border: 1px solid rgba(255,255,255,0.07) !important; border-radius: 12px !important; }
-            button[kind="primary"], .stButton>button {
-                background: linear-gradient(90deg, #0099CC, #00C2FF);
-                border: none;
-                color: #fff;
-                font-weight: 600;
-                border-radius: 10px;
-            }
-            button[kind="primary"]:hover, .stButton>button:hover {
-                opacity: 0.88;
-                transform: translateY(-1px);
-            }
-        </style>
-        """,
+        f'<div class="ss-empty-state">'
+        f'<div class="ss-empty-icon">{icon}</div>'
+        f'<div class="ss-empty-title">{title}</div>'
+        f'<div class="ss-empty-sub">{sub}</div>'
+        f'</div>',
         unsafe_allow_html=True,
     )
 
 
-# ─────────────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────────────
-
-def _section(label: str, title: str) -> None:
-    st.markdown(f'<div class="section-label">{label}</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="section-title">{title}</div>', unsafe_allow_html=True)
-
-
-def _empty(icon: str, message: str) -> None:
-    st.markdown(
-        f'<div class="empty-state"><div class="empty-state-icon">{icon}</div>{message}</div>',
-        unsafe_allow_html=True,
-    )
+def _hr() -> None:
+    """Render a themed horizontal rule."""
+    st.markdown('<hr class="ss-divider">', unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────────────────────
-# NLP / CACHE
+# CACHE / PIPELINE WRAPPERS  (verbatim — do not modify)
 # ─────────────────────────────────────────────────────────────────
 
 @st.cache_resource(show_spinner=False)
 def prepare_nlp_resources():
+    """Bootstrap spaCy NLP resources (cached across reruns).
+
+    Returns
+    -------
+    tuple[dict, object | None]
+        (status_dict, spacy_nlp_model_or_None)
+    """
     try:
         from utils.bootstrap import bootstrap_nlp, load_spacy_model
         status = bootstrap_nlp(logger=LOGGER, download_missing=True)
         model_name = status.get("spacy", {}).get("model", DEFAULT_SPACY_MODEL)
-        nlp = load_spacy_model(model_name, logger=LOGGER) if status.get("spacy", {}).get("available") else None
+        nlp = (
+            load_spacy_model(model_name, logger=LOGGER)
+            if status.get("spacy", {}).get("available")
+            else None
+        )
         return status, nlp
     except Exception as exc:
         LOGGER.warning("NLP bootstrap failed: %s", exc)
@@ -394,7 +228,31 @@ def prepare_nlp_resources():
 
 
 @st.cache_data(show_spinner=False)
-def run_cached_analysis(file_payloads: tuple, insight_depth: int, selected_columns: tuple, enable_nlp: bool):
+def run_cached_analysis(
+    file_payloads: tuple,
+    insight_depth: int,
+    selected_columns: tuple,
+    enable_nlp: bool,
+) -> dict:
+    """Run the full orchestrator pipeline, cached by inputs.
+
+    Parameters
+    ----------
+    file_payloads    : tuple
+        Serialised uploaded files — ``(name, mime, bytes)`` triples.
+    insight_depth    : int
+        Slider value 1–5 passed to the pipeline.
+    selected_columns : tuple
+        Column filter; empty tuple means all columns.
+    enable_nlp       : bool
+        True when a text-bearing file is present.
+
+    Returns
+    -------
+    dict
+        Orchestrator result dict with keys: data, text, fusion,
+        ranked_insights, warnings, errors, debug.
+    """
     try:
         from core.orchestrator import SmartSummariserOrchestrator
         nlp = None
@@ -408,11 +266,26 @@ def run_cached_analysis(file_payloads: tuple, insight_depth: int, selected_colum
         )
     except Exception as exc:
         LOGGER.warning("Analysis failed: %s", exc)
-        return {"data": None, "text": None, "fusion": None, "warnings": [], "errors": [str(exc)], "debug": {}}
+        return {
+            "data": None, "text": None, "fusion": None,
+            "warnings": [], "errors": [str(exc)], "debug": {},
+        }
 
 
 @st.cache_data(show_spinner=False)
 def preview_structured_columns(file_payloads: tuple) -> list[str]:
+    """Return column names from the first structured file in *file_payloads*.
+
+    Parameters
+    ----------
+    file_payloads : tuple
+        Serialised uploaded files.
+
+    Returns
+    -------
+    list[str]
+        Column names, or empty list on failure.
+    """
     try:
         from modules.data_loader import load_file_payload
         for file_name, _mime, raw_bytes in file_payloads:
@@ -425,544 +298,1071 @@ def preview_structured_columns(file_payloads: tuple) -> list[str]:
 
 
 def serialise_uploads(uploaded_files) -> tuple:
-    return tuple(
-        (f.name, f.type or "", f.getvalue()) for f in uploaded_files
-    )
+    """Convert Streamlit UploadedFile objects to a hashable tuple.
+
+    Parameters
+    ----------
+    uploaded_files : list[UploadedFile]
+        Files from ``st.file_uploader``.
+
+    Returns
+    -------
+    tuple
+        Each element is ``(name: str, mime: str, content: bytes)``.
+    """
+    return tuple((f.name, f.type or "", f.getvalue()) for f in uploaded_files)
 
 
 def contains_text_payloads(file_payloads: tuple) -> bool:
-    """True only if there are PDF/TXT payloads that yielded TEXT (not tables)."""
+    """Return True only if a PDF/TXT file is present in *file_payloads*.
+
+    Parameters
+    ----------
+    file_payloads : tuple
+        Serialised uploads from :func:`serialise_uploads`.
+
+    Returns
+    -------
+    bool
+    """
     return any(infer_file_type(fn) in TEXT_FILE_TYPES for fn, _, _ in file_payloads)
 
 
 # ─────────────────────────────────────────────────────────────────
-# SECTION 1 — SUMMARY (KPI cards)
+# THEME TOGGLE  (shared between top bar and sidebar)
 # ─────────────────────────────────────────────────────────────────
 
-def render_summary_section(results: dict) -> None:
-    _section("Section 1", "Summary")
-    try:
-        data_results = results.get("data") or {}
-        text_results = results.get("text") or {}
+def render_theme_toggle(key_suffix: str = "") -> None:
+    """Render the sun/moon SVG theme-toggle button.
 
-        cards = []
+    Writes ``st.session_state["theme"]`` and calls ``st.rerun()`` on
+    click.  Uses inline SVG icons (no emoji, no CDN).
 
-        if data_results.get("success"):
-            kpis   = data_results.get("analysis", {}).get("kpis", {})
-            stats  = data_results.get("analysis", {}).get("statistics", {})
-            source = data_results.get("source", {})
+    Parameters
+    ----------
+    key_suffix : str, optional
+        Appended to the widget key to allow placement in multiple
+        locations without key collisions.
+    """
+    is_dark = st.session_state.get("theme", "dark") == "dark"
+    # Plain Unicode glyphs — st.button does not render HTML labels
+    label = "\u2600" if is_dark else "\u263D"   # ☀ sun / ☽ crescent moon
 
-            rows     = kpis.get("rows", "—")
-            cols     = kpis.get("columns", "—")
-            num_cols = kpis.get("numerical_columns", 0)
-            cat_cols = kpis.get("categorical_columns", 0)
+    # Inject button-specific style to strip the default padding / background
+    st.markdown("""
+<style>
+div[data-testid="stButton"].ss-toggle > button {
+    background: transparent !important;
+    border: 1px solid var(--border) !important;
+    color: var(--text-secondary) !important;
+    padding: 5px 8px !important;
+    border-radius: 6px !important;
+    font-size: 12px !important;
+    font-weight: 400 !important;
+    min-width: 0 !important;
+    width: auto !important;
+}
+div[data-testid="stButton"].ss-toggle > button:hover {
+    background: var(--bg-primary) !important;
+    color: var(--text-primary) !important;
+    opacity: 1 !important;
+}
+</style>
+""", unsafe_allow_html=True)
 
-            cards.append({"icon": "🗄️", "label": "Total Rows",    "value": format_metric(rows),     "sub": f"{cols} columns"})
-            cards.append({"icon": "🔢", "label": "Numeric Cols",  "value": format_metric(num_cols), "sub": "numeric features"})
-            cards.append({"icon": "🏷️", "label": "Category Cols", "value": format_metric(cat_cols), "sub": "categorical features"})
+    # Wrap in a div with class ss-toggle
+    st.markdown('<div class="ss-toggle" style="display:inline-block">', unsafe_allow_html=True)
+    clicked = st.button(label, key=f"theme_toggle_{key_suffix}", help="Toggle light / dark mode")
+    st.markdown('</div>', unsafe_allow_html=True)
 
-            # Show first numeric mean / max
-            if stats:
-                key_col  = next(iter(stats))
-                mean_val = f"{stats[key_col].get('mean', 0):,.2f}"
-                max_val  = f"{stats[key_col].get('max',  0):,.2f}"
-                cards.append({"icon": "⊘", "label": f"Avg · {humanize_label(key_col)}", "value": mean_val, "sub": f"Max: {max_val}"})
+    if clicked:
+        st.session_state["theme"] = "dark" if not is_dark else "light"
+        st.rerun()
 
-        if text_results.get("success"):
-            text_analysis = text_results.get("analysis", {})
-            word_count = text_analysis.get("word_count", "—")
-            sent_count = text_analysis.get("sentence_count", "—")
-            cards.append({"icon": "📝", "label": "Words", "value": format_metric(word_count), "sub": f"{format_metric(sent_count)} sentences"})
 
-        if not cards:
-            _empty("📂", "Upload a file to see the summary.")
-            return
+# ─────────────────────────────────────────────────────────────────
+# TOP BAR
+# ─────────────────────────────────────────────────────────────────
 
-        card_htmls = []
-        for c in cards:
-            card_htmls.append(f"""
-            <div class="summary-card">
-                <div class="summary-card-label">{c['icon']} {c['label']}</div>
-                <div class="summary-card-value">{c['value']}</div>
-                <div class="summary-card-sub">{c['sub']}</div>
-            </div>""")
+def render_top_bar(theme: dict) -> None:
+    """Render the top bar: wordmark (left) and theme toggle (right).
 
+    Renders in normal document flow — not sticky — to avoid z-index and
+    scroll surprises inside Streamlit's iframe layout.
+
+    Parameters
+    ----------
+    theme : dict
+        Active design-token dict from :func:`utils.theme.get_theme`.
+    """
+    col_wm, col_spacer, col_toggle = st.columns([6, 3, 1])
+    with col_wm:
         st.markdown(
-            f'<div class="summary-row">{"".join(card_htmls)}</div>',
+            '<div class="ss-top-bar">'
+            '<span class="ss-wordmark">Smart Summariser</span>'
+            '</div>',
             unsafe_allow_html=True,
         )
-
-    except Exception as exc:
-        st.error(f"Summary section error: {exc}")
-
-
-# ─────────────────────────────────────────────────────────────────
-# SECTION 2 — STRUCTURED DATA SUMMARY
-# ─────────────────────────────────────────────────────────────────
-
-def render_structured_summary_section(results: dict) -> None:
-    _section("Section 2", "Structured Data Summary")
-
-    try:
-        data_results = results.get("data") or {}
-
-        if not data_results.get("success"):
-            text_results = results.get("text") or {}
-            if text_results.get("success"):
-                _empty("📄", "PDF text mode — no tabular data to summarise column-wise.")
-            else:
-                _empty("📋", "Upload a CSV, Excel, or PDF with a table to see column-wise summary.")
-            return
-
-        df: pd.DataFrame = data_results.get("dataframe", pd.DataFrame())
-        schema = data_results.get("schema", {})
-        stats  = data_results.get("analysis", {}).get("statistics", {})
-
-        if df.empty:
-            _empty("📋", "No data available.")
-            return
-
-        numerical  = set(schema.get("numerical",  []))
-        categorical = set(schema.get("categorical", []))
-        datetime   = set(schema.get("datetime",   []))
-
-        rows_html = ""
-        for col in df.columns:
-            if col in numerical:
-                badge = '<span class="col-type-badge badge-numeric">numeric</span>'
-                col_stats = stats.get(col, {})
-                mean_v = col_stats.get("mean", None)
-                min_v  = col_stats.get("min",  None)
-                max_v  = col_stats.get("max",  None)
-                samples = df[col].dropna().head(3).tolist()
-                sample_txt = ", ".join(f"{v:,.2f}" if isinstance(v, float) else str(v) for v in samples)
-                detail = f"avg: {mean_v:,.2f} &nbsp;|&nbsp; min: {min_v:,.2f} &nbsp;|&nbsp; max: {max_v:,.2f}" if mean_v is not None else sample_txt
-            elif col in datetime:
-                badge = '<span class="col-type-badge badge-datetime">datetime</span>'
-                samples = df[col].dropna().head(3).astype(str).tolist()
-                sample_txt = ", ".join(samples)
-                detail = sample_txt
-            else:
-                badge = '<span class="col-type-badge badge-category">categorical</span>'
-                samples = df[col].dropna().head(3).astype(str).tolist()
-                sample_txt = ", ".join(samples)
-                unique_n = int(df[col].nunique(dropna=True))
-                detail = f"{sample_txt} &nbsp;({unique_n} unique)"
-
-            rows_html += f"""
-            <tr>
-                <td><span class="col-name">{col}</span></td>
-                <td>{badge}</td>
-                <td>{detail}</td>
-                <td style="color:#8B9AAA;">{int(df[col].notna().sum())}</td>
-            </tr>"""
-
-        table_html = f"""
-        <table class="col-summary-table">
-            <thead>
-                <tr>
-                    <th>Column</th>
-                    <th>Type</th>
-                    <th>Sample / Summary</th>
-                    <th>Non-null</th>
-                </tr>
-            </thead>
-            <tbody>{rows_html}</tbody>
-        </table>"""
-
-        st.markdown(table_html, unsafe_allow_html=True)
-
-        with st.expander("📋 Full Statistics (describe)", expanded=False):
-            try:
-                st.dataframe(df.describe(include="all").round(2), use_container_width=True)
-            except Exception:
-                pass
-
-    except Exception as exc:
-        st.error(f"Structured summary section error: {exc}")
+    with col_toggle:
+        st.markdown('<div style="padding-top:18px;">', unsafe_allow_html=True)
+        render_theme_toggle(key_suffix="topbar")
+        st.markdown('</div>', unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────────────────────
-# SECTION 3 — CHARTS (max 4)
+# LANDING SCREEN
 # ─────────────────────────────────────────────────────────────────
 
-def render_charts_section(results: dict) -> None:
-    _section("Section 3", "Charts")
-
-    try:
-        data_results = results.get("data") or {}
-        if not data_results.get("success"):
-            _empty("📊", "Upload a CSV, Excel, or PDF with a table to generate charts.")
-            return
-
-        import plotly.express as px
-
-        df: pd.DataFrame = data_results.get("dataframe", pd.DataFrame())
-        schema = data_results.get("schema", {})
-
-        if df.empty:
-            _empty("📊", "No data available to chart.")
-            return
-
-        numeric_cols    = [c for c in schema.get("numerical",  []) if c in df.columns]
-        categorical_cols = [c for c in schema.get("categorical", []) if c in df.columns]
-        datetime_cols   = [c for c in df.columns if pd.api.types.is_datetime64_any_dtype(df[c])]
-
-        CHART_LAYOUT = dict(
-            paper_bgcolor="#0E1117",
-            plot_bgcolor="#0E1117",
-            font_color="#E6EDF3",
-            font=dict(family="Inter, Segoe UI, sans-serif", size=12, color="#E6EDF3"),
-            margin=dict(l=0, r=0, t=40, b=0),
-            hoverlabel=dict(bgcolor="#111827", bordercolor="#1F2937", font_color="#E6EDF3"),
-        )
-
-        charts_rendered = 0
-
-        # Chart 1 — Line chart (datetime × numeric)
-        if charts_rendered < 4 and datetime_cols and numeric_cols:
-            try:
-                dt_col  = datetime_cols[0]
-                val_col = numeric_cols[0]
-                frame   = df[[dt_col, val_col]].dropna().sort_values(dt_col)
-                if not frame.empty:
-                    fig = px.line(frame, x=dt_col, y=val_col, markers=True,
-                                  color_discrete_sequence=["#34D399"])
-                    fig.update_traces(line_width=2.5, marker_size=6,
-                                      fill="tozeroy", fillcolor="rgba(52,211,153,0.07)")
-                    fig.update_layout(
-                        title=dict(text=f"📈 {humanize_label(val_col)} Over Time",
-                                   font=dict(size=13, color="#E6EDF3"), x=0),
-                        showlegend=False,
-                        xaxis=dict(showgrid=False, zeroline=False),
-                        yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.05)", zeroline=False),
-                        **CHART_LAYOUT,
-                    )
-                    st.markdown('<div class="chart-wrap">', unsafe_allow_html=True)
-                    st.plotly_chart(fig, use_container_width=True, key="chart_1_line")
-                    st.markdown('</div>', unsafe_allow_html=True)
-                    charts_rendered += 1
-            except Exception as exc:
-                LOGGER.warning("Line chart failed: %s", exc)
-
-        # Chart 2 — Histogram (first numeric col)
-        if charts_rendered < 4 and numeric_cols:
-            try:
-                col = numeric_cols[0]
-                fig = px.histogram(df, x=col, nbins=20,
-                                   color_discrete_sequence=["#00C2FF"], opacity=0.88)
-                fig.update_traces(marker_line_width=0)
-                fig.update_layout(
-                    title=dict(text=f"📊 {humanize_label(col)} Distribution",
-                               font=dict(size=13, color="#E6EDF3"), x=0),
-                    showlegend=False, bargap=0.06,
-                    xaxis=dict(showgrid=False, zeroline=False),
-                    yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.05)", zeroline=False),
-                    **CHART_LAYOUT,
-                )
-                st.markdown('<div class="chart-wrap">', unsafe_allow_html=True)
-                st.plotly_chart(fig, use_container_width=True, key="chart_2_histogram")
-                st.markdown('</div>', unsafe_allow_html=True)
-                charts_rendered += 1
-            except Exception as exc:
-                LOGGER.warning("Histogram failed: %s", exc)
-
-        # Chart 3 — Bar chart (top categorical col)
-        if charts_rendered < 4 and categorical_cols:
-            try:
-                col    = categorical_cols[0]
-                counts = df[col].fillna("Missing").astype(str).value_counts().head(10).reset_index()
-                counts.columns = [col, "count"]
-                counts = counts.sort_values("count", ascending=True)
-                fig = px.bar(
-                    counts, x="count", y=col, orientation="h",
-                    color=col,
-                    color_discrete_sequence=["#00C2FF","#34D399","#F59E0B","#FB7185","#A78BFA",
-                                             "#38BDF8","#F97316","#2DD4BF"],
-                    text="count",
-                )
-                fig.update_traces(marker_line_width=0, textposition="outside", textfont_size=11)
-                fig.update_layout(
-                    title=dict(text=f"📊 {humanize_label(col)} Breakdown",
-                               font=dict(size=13, color="#E6EDF3"), x=0),
-                    showlegend=False, bargap=0.18,
-                    xaxis=dict(showgrid=False, zeroline=False),
-                    yaxis=dict(showgrid=False, zeroline=False),
-                    **CHART_LAYOUT,
-                )
-                st.markdown('<div class="chart-wrap">', unsafe_allow_html=True)
-                st.plotly_chart(fig, use_container_width=True, key="chart_3_bar")
-                st.markdown('</div>', unsafe_allow_html=True)
-                charts_rendered += 1
-            except Exception as exc:
-                LOGGER.warning("Bar chart failed: %s", exc)
-
-        # Chart 4 — Pie / donut (second categorical or same col)
-        if charts_rendered < 4 and categorical_cols:
-            try:
-                # Pick second categorical if available for diversity
-                pie_col = categorical_cols[1] if len(categorical_cols) > 1 else categorical_cols[0]
-                counts  = df[pie_col].fillna("Missing").astype(str).value_counts().head(6).reset_index()
-                counts.columns = [pie_col, "count"]
-                fig = px.pie(
-                    counts, names=pie_col, values="count", hole=0.50,
-                    color=pie_col,
-                    color_discrete_sequence=["#00C2FF","#34D399","#F59E0B","#FB7185","#A78BFA","#38BDF8"],
-                )
-                fig.update_traces(
-                    textposition="inside", textinfo="percent+label",
-                    marker=dict(line=dict(color="#0E1117", width=2)),
-                )
-                fig.update_layout(
-                    title=dict(text=f"🥧 {humanize_label(pie_col)} Share",
-                               font=dict(size=13, color="#E6EDF3"), x=0),
-                    showlegend=False,
-                    **CHART_LAYOUT,
-                )
-                st.markdown('<div class="chart-wrap">', unsafe_allow_html=True)
-                st.plotly_chart(fig, use_container_width=True, key="chart_4_pie")
-                st.markdown('</div>', unsafe_allow_html=True)
-                charts_rendered += 1
-            except Exception as exc:
-                LOGGER.warning("Pie chart failed: %s", exc)
-
-        if charts_rendered == 0:
-            _empty("📊", "No charts could be generated. Ensure your file has numeric or categorical columns.")
-
-    except Exception as exc:
-        st.error(f"Charts section error: {exc}")
-
-
-# ─────────────────────────────────────────────────────────────────
-# SECTION 4 — RANKED INSIGHTS (Intelligence Engine)
-# ─────────────────────────────────────────────────────────────────
-
-_RANK_MEDALS = ["🥇", "🥈", "🥉"]
-_SOURCE_BADGE = {
-    "data":    ('badge-data',    'DATA'),
-    "text":    ('badge-text',    'TEXT'),
-    "fusion":  ('badge-fusion',  'FUSION'),
-    "anomaly": ('badge-anomaly', 'ANOMALY'),
+def render_hero() -> None:
+    """Render the large Times New Roman bold italic headline on the landing screen."""
+    st.markdown(
+        '<div class="ss-hero">'
+        '<h1 class="ss-hero-headline">What&#8217;s on your mind\u2009?</h1>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    # Ensure headline is dark regardless of theme
+    st.markdown("""
+<style>
+.ss-hero-headline {
+    font-family: "Times New Roman", Times, serif !important;
+    font-style: italic !important;
+    font-weight: 700 !important;
+    color: #1A1A1A !important;
+    font-size: clamp(32px, 5vw, 52px) !important;
+    letter-spacing: -1px;
+    line-height: 1.1;
+    margin: 0;
 }
+</style>
+""", unsafe_allow_html=True)
 
 
-def _render_ranked_insight_card(rank: int, ins: dict) -> str:
-    """Build the HTML for a single ranked insight card."""
-    title   = ins.get("title", "Insight")
-    desc    = ins.get("description", ins.get("text", ""))
-    score   = float(ins.get("score", ins.get("priority", 50) / 100))
-    evidence = ins.get("evidence", [])
-    source  = ins.get("source", "data")
+def render_upload_card() -> None:
+    """Render the centred dashed upload card on the landing screen.
 
-    rank_icon = _RANK_MEDALS[rank] if rank < 3 else f"#{rank + 1}"
-    badge_cls, badge_label = _SOURCE_BADGE.get(source, ('badge-data', source.upper()))
-    score_pct = int(min(100, max(0, score * 100)))
-    score_bar_color = (
-        "linear-gradient(90deg,#34D399,#10B981)" if score >= 0.85
-        else "linear-gradient(90deg,#F59E0B,#FBBF24)" if score >= 0.65
-        else "linear-gradient(90deg,#0099CC,#00C2FF)"
+    The file uploader widget inside this card writes to
+    ``st.session_state["file_uploader"]`` so the main function can
+    read the result without the card needing to return it.
+    """
+    # Cloud-upload SVG (inline, no CDN)
+    upload_svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" '
+        'viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+        'stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" '
+        'style="opacity:0.4;color:var(--text-primary)">'
+        '<polyline points="16 16 12 12 8 16"/>'
+        '<line x1="12" y1="12" x2="12" y2="21"/>'
+        '<path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/>'
+        '</svg>'
     )
 
-    # Evidence chips
-    ev_html = ""
-    if evidence:
-        chips = "".join(
-            f'<span class="ri-ev-chip">{ev}</span>' for ev in evidence[:6]
-        )
-        ev_html = f'<div class="ri-evidence">{chips}</div>'
-
-    return f"""
-    <div class="ri-card">
-        <div class="ri-header">
-            <div class="ri-rank">{rank_icon}</div>
-            <div class="ri-title-block">
-                <div class="ri-title">{title}</div>
-                <div class="ri-badges">
-                    <span class="ri-badge {badge_cls}">{badge_label}</span>
-                </div>
-            </div>
-        </div>
-        <div class="ri-score-wrap">
-            <div class="ri-score-bar-bg">
-                <div class="ri-score-bar-fill" style="width:{score_pct}%;background:{score_bar_color};"></div>
-            </div>
-            <div class="ri-score-label">Score {score_pct}%</div>
-        </div>
-        <div class="ri-description">{desc}</div>
-        {ev_html}
-    </div>"""
+    st.markdown(
+        '<div class="ss-upload-card">'
+        f'<div class="ss-upload-card-icon">{upload_svg}</div>'
+        '<div class="ss-upload-card-title">Upload a file to get started</div>'
+        '<div class="ss-upload-helper">'
+        'CSV or Excel &rarr; structured analytics, charts &amp; insights.<br>'
+        'PDF with table &rarr; full data dashboard.<br>'
+        'TXT or prose PDF &rarr; document summary &amp; keyword extraction.'
+        '</div>'
+        '<div class="ss-upload-helper" style="margin-top:8px;font-style:italic;">'
+        '&uarr; Use the sidebar uploader on the left to choose your file.'
+        '</div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    # NOTE: no st.file_uploader here — the sidebar owns the single
+    # key="file_uploader" widget to avoid StreamlitDuplicateElementKey.
 
 
-def render_insights_section(results: dict) -> None:
-    _section("Section 4", "Ranked Insights")
+def render_feature_cards() -> None:
+    """Render the four-card feature grid below the upload card."""
+    st.markdown(
+        '<div class="ss-eyebrow">GET STARTED</div>',
+        unsafe_allow_html=True,
+    )
 
-    try:
-        # ── PRIMARY PATH: use unified ranked_insights from intelligence engine ──
-        ranked = results.get("ranked_insights") or []
+    cards = [
+        ("📊", "Structured Analytics",
+         "Upload CSV or Excel to generate charts, KPIs and trends."),
+        ("📈", "Full Data Dashboard",
+         "Turn your data into interactive dashboards and reports."),
+        ("📄", "Document Summary",
+         "Get concise summaries and extract key insights."),
+        ("🔍", "Keyword Extraction",
+         "Extract important keywords and themes from documents."),
+    ]
 
-        # ranked_insights may be Insight objects or dicts; normalise to dicts
-        ranked_dicts: list[dict] = []
-        for item in ranked:
-            if isinstance(item, dict):
-                ranked_dicts.append(item)
-            elif hasattr(item, "to_dict"):
-                ranked_dicts.append(item.to_dict())
-
-        if ranked_dicts:
-            # Show top-line score summary
-            top_score = float(ranked_dicts[0].get("score", 1.0))
-            sources_present = list(dict.fromkeys(
-                item.get("source", "data") for item in ranked_dicts
-            ))
-            source_labels = " · ".join(
-                f'<span class="ri-badge {_SOURCE_BADGE.get(s, ("badge-data",""))[0]}"'
-                f' style="margin-right:4px">{_SOURCE_BADGE.get(s,("badge-data", s.upper()))[1]}</span>'
-                for s in sources_present
-            )
+    cols = st.columns(4, gap="small")
+    for col, (icon, title, body) in zip(cols, cards):
+        with col:
             st.markdown(
-                f'<div style="margin-bottom:0.9rem;font-size:0.81rem;color:#7B8899;">'
-                f'<span style="color:#E6EDF3;font-weight:700;">{len(ranked_dicts)}</span> insights ranked · '
-                f'Top score: <span style="color:#34D399;font-weight:700;">{int(top_score*100)}%</span> · '
-                f'Sources: {source_labels}</div>',
+                f'<div class="ss-feature-card">'
+                f'<div class="ss-feature-icon-badge">{icon}</div>'
+                f'<div class="ss-feature-title">{title}</div>'
+                f'<div class="ss-feature-body">{body}</div>'
+                f'<div class="ss-feature-arrow">→</div>'
+                f'</div>',
                 unsafe_allow_html=True,
             )
 
-            # Render each card
-            for rank, ins in enumerate(ranked_dicts):
+
+def render_landing(theme: dict) -> None:
+    """Render the complete landing screen (no file uploaded).
+
+    Parameters
+    ----------
+    theme : dict
+        Active design-token dict.
+    """
+    render_hero()
+    render_upload_card()
+    render_feature_cards()
+
+
+# ─────────────────────────────────────────────────────────────────
+# SIDEBAR
+# ─────────────────────────────────────────────────────────────────
+
+def render_sidebar(theme: dict) -> tuple[int, list[str], list]:
+    """Render the sidebar and return the user's selections.
+
+    Contains: wordmark, theme toggle, nav, depth slider, file uploader,
+    column selector, and file chips.
+
+    Parameters
+    ----------
+    theme : dict
+        Active design-token dict (used for toggle icon).
+
+    Returns
+    -------
+    tuple[int, list[str], list]
+        ``(insight_depth, selected_columns, uploaded_files)``
+    """
+    with st.sidebar:
+        # ── Wordmark + toggle row ──────────────────────────────────
+        c_wm, c_btn = st.columns([5, 2])
+        with c_wm:
+            st.markdown(
+                '<div class="sb-wordmark">Smart Summariser</div>',
+                unsafe_allow_html=True,
+            )
+        with c_btn:
+            st.markdown('<div style="padding-top:4px;">', unsafe_allow_html=True)
+            render_theme_toggle(key_suffix="sidebar")
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        # ── Nav (cosmetic — sections are in-page) ─────────────────
+        st.markdown("""
+<div class="sb-nav">
+  <div class="sb-nav-item active">
+    <span class="sb-nav-icon">◧</span>Overview
+  </div>
+  <div class="sb-nav-item">
+    <span class="sb-nav-icon">◫</span>Charts
+  </div>
+  <div class="sb-nav-item">
+    <span class="sb-nav-icon">◎</span>Insights
+  </div>
+</div>""", unsafe_allow_html=True)
+
+        _hr()
+
+        # ── Insight depth ──────────────────────────────────────────
+        st.markdown(
+            '<div class="sb-section-label">Insight depth</div>',
+            unsafe_allow_html=True,
+        )
+        insight_depth = st.slider(
+            "Insight depth",
+            min_value=1, max_value=5, value=3,
+            key="depth_slider",
+            label_visibility="collapsed",
+        )
+        st.markdown(
+            f'<div class="sb-depth-meta">Level {insight_depth} of 5</div>',
+            unsafe_allow_html=True,
+        )
+
+        _hr()
+
+        # ── File uploader ──────────────────────────────────────────
+        st.markdown(
+            '<div class="sb-section-label">Upload files</div>',
+            unsafe_allow_html=True,
+        )
+        uploaded_files = st.file_uploader(
+            "Upload files",
+            type=["csv", "xlsx", "xls", "pdf", "txt"],
+            accept_multiple_files=True,
+            key="file_uploader",
+            label_visibility="collapsed",
+        )
+
+        payloads     = serialise_uploads(uploaded_files) if uploaded_files else tuple()
+        preview_cols = preview_structured_columns(payloads) if payloads else []
+        default_cols = (
+            preview_cols[: min(6, len(preview_cols))]
+            if len(preview_cols) > 6
+            else preview_cols
+        )
+
+        # ── Column selector ────────────────────────────────────────
+        if preview_cols:
+            _hr()
+            st.markdown(
+                '<div class="sb-section-label">Columns</div>',
+                unsafe_allow_html=True,
+            )
+            selected_columns = st.multiselect(
+                "Active columns",
+                options=preview_cols,
+                default=default_cols,
+                key="col_select",
+                label_visibility="collapsed",
+            )
+            n_active = len(selected_columns or preview_cols)
+            st.markdown(
+                f'<div class="sb-col-meta">'
+                f'{n_active} of {len(preview_cols)} active</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            selected_columns = []
+
+        # ── File chips ─────────────────────────────────────────────
+        if uploaded_files:
+            _hr()
+            for f in uploaded_files:
+                kb       = len(f.getvalue()) / 1024
+                size_str = f"{kb:.1f} KB" if kb < 1000 else f"{kb / 1024:.1f} MB"
                 st.markdown(
-                    _render_ranked_insight_card(rank, ins),
-                    unsafe_allow_html=True,
-                )
-
-            # ── Fusion keyword matches (if present) ──────────────
-            fusion_results = results.get("fusion") or {}
-            matches = fusion_results.get("matches", [])
-            if matches:
-                pills = "".join(
-                    f'<span class="ri-match-pill">'
-                    f'{m.get("term", "")} → {humanize_label(m.get("column", ""))}'
-                    f' <span style="opacity:0.6">({int(m.get("score",0)*100)}%)</span>'
-                    f'</span>'
-                    for m in matches[:12]
-                )
-                method = matches[0].get("match_method", "difflib") if matches else "difflib"
-                st.markdown(
-                    f'<div class="ri-fusion-matches">'
-                    f'<div class="ri-match-title">🔗 NLP ↔ Data Keyword Links '
-                    f'<span style="opacity:0.5;font-weight:400;text-transform:none;font-size:0.68rem;">'
-                    f'via {method}</span></div>'
-                    f'{pills}</div>',
-                    unsafe_allow_html=True,
-                )
-
-            # ── Keyword tags from text pipeline ─────────────────
-            text_results = results.get("text") or {}
-            if text_results.get("success"):
-                keywords: list[dict] = text_results.get("analysis", {}).get("keywords", [])
-                if keywords:
-                    kw_items = keywords[:12]
-                    badges = " ".join(
-                        f'<span style="background:rgba(0,194,255,0.08);color:#7FDBFF;'
-                        f'padding:0.15rem 0.6rem;border-radius:999px;font-size:0.76rem;'
-                        f'margin:2px;display:inline-block;border:1px solid rgba(0,194,255,0.16);'
-                        f'opacity:{0.5 + 0.5 * kw.get("importance", kw.get("score", 0)):.2f};">'
-                        f'{kw["term"]}</span>'
-                        for kw in kw_items
-                    )
-                    st.markdown(
-                        f'<div class="text-summary-box" style="margin-top:0.8rem;">'
-                        f'<div class="text-summary-title">🔑 Top Keywords · opacity = importance</div>'
-                        f'<div style="padding-top:0.4rem;">{badges}</div></div>',
-                        unsafe_allow_html=True,
-                    )
-            return
-
-        # ── FALLBACK PATH: no ranked_insights — legacy renderer ───────────────
-        data_results  = results.get("data")  or {}
-        text_results  = results.get("text")  or {}
-        rendered_anything = False
-
-        if data_results.get("success"):
-            rendered_anything = True
-            legacy_insights: list[dict] = data_results.get("insights", [])
-            if legacy_insights:
-                for ins in legacy_insights:
-                    title = ins.get("title", "")
-                    text  = ins.get("text", ins.get("description", ""))
-                    if text:
-                        st.markdown(
-                            f'<div class="insight-item">'
-                            f'<div class="insight-title">{title}</div>{text}'
-                            f'</div>',
-                            unsafe_allow_html=True,
-                        )
-
-        if text_results.get("success"):
-            rendered_anything = True
-            pipeline_insights: list[dict] = text_results.get("insights", [])
-            text_analysis = text_results.get("analysis", {})
-            summary = text_analysis.get("summary", "").strip()
-            keywords: list[dict] = text_analysis.get("keywords", [])
-
-            if summary:
-                st.markdown(
-                    f'<div class="text-summary-box">'
-                    f'<div class="text-summary-title">📄 Document Summary</div>'
-                    f'<div class="text-summary-body">{summary}</div>'
+                    f'<div class="sb-file-chip">'
+                    f'<span class="sb-chip-name">{f.name}</span>'
+                    f'<span class="sb-chip-size">{size_str}</span>'
                     f'</div>',
                     unsafe_allow_html=True,
                 )
 
-            for ins in pipeline_insights[:6]:
-                title = ins.get("title", "")
-                text  = ins.get("text", "")
-                if text:
+    return insight_depth, selected_columns, uploaded_files
+
+
+# ─────────────────────────────────────────────────────────────────
+# KPI ROW
+# ─────────────────────────────────────────────────────────────────
+
+def render_kpi_row(results: dict) -> None:
+    """Render the four KPI cards in the Overview section.
+
+    Reads ``results["data"]["analysis"]["kpis"]`` and ``["statistics"]``.
+    Silently skips if the data pipeline did not succeed.
+
+    Parameters
+    ----------
+    results : dict
+        Full orchestrator output dict.
+    """
+    data_results = results.get("data") or {}
+    if not data_results.get("success"):
+        return
+
+    kpis  = data_results.get("analysis", {}).get("kpis", {})
+    stats = data_results.get("analysis", {}).get("statistics", {})
+    df    = data_results.get("dataframe", pd.DataFrame())
+
+    rows      = kpis.get("rows", 0)
+    total_cols = kpis.get("columns", 0)
+    num_cols  = kpis.get("numerical_columns", 0)
+    cat_cols  = kpis.get("categorical_columns", 0)
+
+    # Missing % across numeric columns
+    missing_pct = 0
+    if not df.empty and num_cols > 0:
+        numeric_names = data_results.get("schema", {}).get("numerical", [])
+        numeric_in_df = [c for c in numeric_names if c in df.columns]
+        if numeric_in_df:
+            total_cells = rows * len(numeric_in_df)
+            missing_cells = df[numeric_in_df].isna().sum().sum()
+            missing_pct = round(missing_cells / total_cells * 100, 1) if total_cells > 0 else 0
+
+    # Unique values count across categorical columns
+    cat_unique = 0
+    cat_names  = data_results.get("schema", {}).get("categorical", [])
+    cat_in_df  = [c for c in cat_names if c in df.columns]
+    if cat_in_df:
+        cat_unique = int(df[cat_in_df[0]].nunique(dropna=True))
+
+    # Average of the largest numeric column
+    avg_label = "Avg metric"
+    avg_value = "—"
+    avg_hint  = ""
+    if stats:
+        key_col = next(iter(stats))
+        mean_v  = stats[key_col].get("mean", None)
+        if mean_v is not None:
+            avg_label = f"Avg {humanize_label(key_col)}"
+            avg_value = (
+                f"{mean_v:,.0f}" if abs(mean_v) >= 100 else f"{mean_v:,.2f}"
+            )
+            max_v = stats[key_col].get("max", 0)
+            avg_hint = f"max {format_metric(max_v)}"
+
+    st.markdown(
+        f'<div class="ss-kpi-grid">'
+
+        # Card 1 — Total rows
+        f'<div class="ss-kpi-card">'
+        f'<div class="ss-kpi-label">Total rows</div>'
+        f'<div class="ss-kpi-value">{format_metric(rows)}</div>'
+        f'<div class="ss-kpi-sub">{format_metric(total_cols)} columns</div>'
+        f'</div>'
+
+        # Card 2 — Numeric columns
+        f'<div class="ss-kpi-card">'
+        f'<div class="ss-kpi-label">Numeric</div>'
+        f'<div class="ss-kpi-value">{format_metric(num_cols)}</div>'
+        f'<div class="ss-kpi-sub">{missing_pct}% missing</div>'
+        f'</div>'
+
+        # Card 3 — Categorical columns
+        f'<div class="ss-kpi-card">'
+        f'<div class="ss-kpi-label">Categories</div>'
+        f'<div class="ss-kpi-value">{format_metric(cat_cols)}</div>'
+        f'<div class="ss-kpi-sub">{format_metric(cat_unique)} unique values</div>'
+        f'</div>'
+
+        # Card 4 — Avg metric
+        f'<div class="ss-kpi-card">'
+        f'<div class="ss-kpi-label">{avg_label}</div>'
+        f'<div class="ss-kpi-value">{avg_value}</div>'
+        f'<div class="ss-kpi-sub">{avg_hint}</div>'
+        f'</div>'
+
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────
+# CHARTS GRID
+# ─────────────────────────────────────────────────────────────────
+
+def _is_year_col(col: str, series: pd.Series) -> bool:
+    """Return True if *col* is a year-like ordinal column.
+
+    A column is year-like if its name contains "year" (case-insensitive),
+    it has ≤20 unique values, and all non-null integer values fall in
+    [1900, 2100].
+
+    Parameters
+    ----------
+    col    : str            Column name.
+    series : pd.Series      The column data.
+
+    Returns
+    -------
+    bool
+    """
+    name_match = "year" in col.lower()
+    if not name_match:
+        return False
+    unique_vals = series.dropna().unique()
+    if len(unique_vals) > 20:
+        return False
+    try:
+        int_vals = [int(v) for v in unique_vals]
+        return all(1900 <= v <= 2100 for v in int_vals)
+    except (ValueError, TypeError):
+        return False
+
+
+def _plotly_base_layout(theme: dict) -> dict:
+    """Return a Plotly layout dict with theme-aware colours."""
+    return dict(
+        paper_bgcolor=theme["plotly_bg"],
+        plot_bgcolor=theme["plotly_bg"],
+        font=dict(
+            family="-apple-system, Segoe UI, system-ui, sans-serif",
+            size=12,
+            color=theme["text_primary"],
+        ),
+        margin=dict(l=40, r=20, t=30, b=40),
+        hoverlabel=dict(
+            bgcolor=theme["plotly_hover_bg"],
+            bordercolor=theme["border"],
+            font_color=theme["text_primary"],
+            font_size=12,
+        ),
+        showlegend=False,
+    )
+
+
+def _axis_x(theme: dict, **extra) -> dict:
+    """Return x-axis kwargs for Plotly update_xaxes."""
+    base = dict(
+        showgrid=False,
+        zeroline=False,
+        showline=False,
+        tickfont=dict(size=11, color=theme["plotly_tick"]),
+    )
+    base.update(extra)
+    return base
+
+
+def _axis_y(theme: dict, **extra) -> dict:
+    """Return y-axis kwargs for Plotly update_yaxes."""
+    base = dict(
+        showgrid=True,
+        gridcolor=theme["plotly_grid"],
+        zeroline=False,
+        showline=False,
+        tickfont=dict(size=11, color=theme["plotly_tick"]),
+    )
+    base.update(extra)
+    return base
+
+
+def render_charts_grid(results: dict, theme: dict) -> None:
+    """Render the 2-column chart grid in the Charts section.
+
+    Chart selection logic per column:
+
+    * Year-like columns (name contains "year", ≤20 uniq, values 1900–2100):
+      → vertical bar of largest numeric metric summed per year.
+    * Other numeric columns → histogram (15–20 bins).
+    * Categorical columns with ≤20 unique values → multi-colour donut pie
+    * Categorical columns with >20 unique values → skip; show caption.
+
+    Parameters
+    ----------
+    results : dict
+        Full orchestrator output dict.
+    theme   : dict
+        Active design-token dict.
+    """
+    import plotly.express as px
+
+    st.markdown(
+        '<div class="ss-section-heading">Charts</div>',
+        unsafe_allow_html=True,
+    )
+
+    data_results = results.get("data") or {}
+    if not data_results.get("success"):
+        _empty_state("📊", "No chart data",
+                     "Upload a CSV or Excel file to generate charts.")
+        return
+
+    df: pd.DataFrame = data_results.get("dataframe", pd.DataFrame())
+    schema = data_results.get("schema", {})
+
+    if df.empty:
+        _empty_state("📊", "Empty dataset", "No rows to visualise.")
+        return
+
+    palette       = theme["palette"]
+    numeric_cols   = [c for c in schema.get("numerical",   []) if c in df.columns]
+    categorical_cols = [c for c in schema.get("categorical", []) if c in df.columns]
+    layout        = _plotly_base_layout(theme)
+
+    # ── Accumulate (title, fig | None, skip_msg | "") tuples ──────
+    figs: list[tuple[str, object | None, str]] = []
+
+    # Separate year-like columns from regular numeric columns
+    year_cols        = [c for c in numeric_cols if _is_year_col(c, df[c])]
+    non_year_numeric = [c for c in numeric_cols if c not in year_cols]
+
+    # ── Chart A: Year bar (only when a year col exists) ───────────
+    for yr_col in year_cols[:1]:
+        metric = next((c for c in non_year_numeric), None)
+        if metric is None:
+            continue
+        try:
+            agg = (
+                df.groupby(yr_col)[metric]
+                .sum().reset_index().sort_values(yr_col)
+            )
+            fig = px.bar(
+                agg, x=yr_col, y=metric,
+                color_discrete_sequence=[palette[0]],
+                text=metric,
+            )
+            fig.update_traces(
+                marker_line_width=0,
+                texttemplate="%{text:,.0f}",
+                textposition="outside",
+                textfont=dict(size=10, color=theme["text_secondary"]),
+            )
+            fig.update_layout(
+                xaxis_type="category",
+                yaxis_range=[0, agg[metric].max() * 1.25],
+                **layout,
+            )
+            fig.update_xaxes(**_axis_x(theme))
+            fig.update_yaxes(**_axis_y(theme))
+            figs.append((
+                f"{humanize_label(metric)} by {humanize_label(yr_col)}",
+                fig, "",
+            ))
+        except Exception as exc:
+            LOGGER.warning("Year-bar chart failed: %s", exc)
+
+    # ── Chart 1: Histogram — distribution of first numeric col ────
+    if len(non_year_numeric) >= 1:
+        col = non_year_numeric[0]
+        try:
+            fig = px.histogram(
+                df, x=col, nbins=20,
+                color_discrete_sequence=[palette[0]],
+                opacity=0.88,
+            )
+            fig.update_traces(marker_line_width=0)
+            fig.update_layout(bargap=0.05, **layout)
+            fig.update_xaxes(**_axis_x(theme))
+            fig.update_yaxes(**_axis_y(theme))
+            figs.append((f"{humanize_label(col)} distribution", fig, ""))
+        except Exception as exc:
+            LOGGER.warning("Histogram failed (%s): %s", col, exc)
+
+    # ── Chart 2: Line chart — sorted trend for second numeric col ─
+    if len(non_year_numeric) >= 2:
+        col = non_year_numeric[1]
+        try:
+            trend_df = df[[col]].dropna().reset_index(drop=True)
+            trend_df = trend_df.sort_values(col).reset_index(drop=True)
+            trend_df["Record"] = range(len(trend_df))
+            # Build fill colour: palette[1] at 12% opacity
+            hex_c = palette[1].lstrip("#")
+            r2, g2, b2 = int(hex_c[0:2], 16), int(hex_c[2:4], 16), int(hex_c[4:6], 16)
+            fill_rgba = f"rgba({r2},{g2},{b2},0.12)"
+            fig = px.line(
+                trend_df, x="Record", y=col,
+                color_discrete_sequence=[palette[1]],
+            )
+            fig.update_traces(
+                line=dict(width=2),
+                fill="tozeroy",
+                fillcolor=fill_rgba,
+            )
+            fig.update_layout(**layout)
+            fig.update_xaxes(title_text="Record (sorted)", **_axis_x(theme))
+            fig.update_yaxes(**_axis_y(theme))
+            figs.append((f"{humanize_label(col)} trend", fig, ""))
+        except Exception as exc:
+            LOGGER.warning("Line chart failed (%s): %s", col, exc)
+
+    # ── Chart 3: Candlestick — quartile-based OHLC per category ───
+    #    Open=Q1, Close=Q3, Low=5th pct, High=95th pct of numeric col
+    if non_year_numeric and categorical_cols:
+        candle_metric = (non_year_numeric[2] if len(non_year_numeric) >= 3
+                         else non_year_numeric[0])
+        cat_col_c = categorical_cols[0]
+        n_cats_c  = df[cat_col_c].nunique(dropna=True)
+        if n_cats_c <= 20:
+            try:
+                import plotly.graph_objects as go
+                grp = df.groupby(cat_col_c)[candle_metric]
+                ohlc = pd.DataFrame({
+                    "x":    grp.apply(lambda s: s.dropna().quantile(0.5)),
+                    "open": grp.apply(lambda s: s.dropna().quantile(0.25)),
+                    "high": grp.apply(lambda s: s.dropna().quantile(0.95)),
+                    "low":  grp.apply(lambda s: s.dropna().quantile(0.05)),
+                    "close":grp.apply(lambda s: s.dropna().quantile(0.75)),
+                }).reset_index()
+                # Sort by median descending
+                ohlc = ohlc.sort_values("x", ascending=False)
+                candle_fig = go.Figure(data=[go.Candlestick(
+                    x=ohlc[cat_col_c],
+                    open=ohlc["open"],
+                    high=ohlc["high"],
+                    low=ohlc["low"],
+                    close=ohlc["close"],
+                    increasing_line_color=palette[1],   # green
+                    decreasing_line_color=palette[3],   # coral/red
+                    increasing_fillcolor=palette[1],
+                    decreasing_fillcolor=palette[3],
+                    line=dict(width=1),
+                    whiskerwidth=0.5,
+                )])
+                candle_layout = {k: v for k, v in layout.items()
+                                 if k != "showlegend"}
+                candle_fig.update_layout(
+                    showlegend=False,
+                    xaxis_rangeslider_visible=False,
+                    **candle_layout,
+                )
+                candle_fig.update_xaxes(**_axis_x(theme))
+                candle_fig.update_yaxes(**_axis_y(theme))
+                figs.append((
+                    f"{humanize_label(candle_metric)} range"
+                    f" by {humanize_label(cat_col_c)}",
+                    candle_fig, "",
+                ))
+            except Exception as exc:
+                LOGGER.warning("Candlestick chart failed: %s", exc)
+
+    # 3. Market share — first categorical × first numeric metric (grouped sum → donut)
+    if categorical_cols and non_year_numeric:
+        cat_col    = categorical_cols[0]
+        metric_col = non_year_numeric[0]
+        n_unique   = df[cat_col].nunique(dropna=True)
+        if n_unique <= 25:
+            try:
+                agg = (
+                    df.groupby(cat_col)[metric_col]
+                    .sum().reset_index()
+                    .sort_values(metric_col, ascending=False)
+                    .head(10)
+                )
+                n_slices     = len(agg)
+                slice_colors = [palette[i % len(palette)] for i in range(n_slices)]
+                total        = agg[metric_col].sum()
+                # Add percentage label so slices show market share
+                agg["pct"] = (agg[metric_col] / total * 100).round(1)
+                fig = px.pie(
+                    agg,
+                    names=cat_col,
+                    values=metric_col,
+                    hole=0.55,
+                    color_discrete_sequence=slice_colors,
+                )
+                fig.update_traces(
+                    textposition="outside",
+                    textinfo="label+percent",
+                    marker=dict(line=dict(
+                        color=theme["bg_secondary"], width=2,
+                    )),
+                    textfont=dict(
+                        size=11,
+                        color=theme["text_primary"],
+                        family="-apple-system, Segoe UI, system-ui, sans-serif",
+                    ),
+                    pull=[0.03] * n_slices,
+                )
+                # Remove showlegend from local call — it already lives in layout
+                mkt_layout = {k: v for k, v in layout.items() if k != "showlegend"}
+                fig.update_layout(showlegend=False, **mkt_layout)
+                figs.append((
+                    f"{humanize_label(cat_col)} market share"
+                    f" by {humanize_label(metric_col)}",
+                    fig, "",
+                ))
+            except Exception as exc:
+                LOGGER.warning("Market-share chart failed: %s", exc)
+
+    if not figs:
+        _empty_state(
+            "📊", "No charts available",
+            "Ensure your file has numeric or categorical columns.",
+        )
+        return
+
+    # ── Render as a 2-column CSS grid ─────────────────────────────
+    figs = figs[:4]   # cap at 4 charts
+    chart_idx = 0     # global counter — guarantees unique keys across all pairs
+    i = 0
+    while i < len(figs):
+        pair = figs[i : i + 2]
+        cols = st.columns(2, gap="medium")
+        for col_widget, (title, fig, skip_msg) in zip(cols, pair):
+            with col_widget:
+                if skip_msg:
                     st.markdown(
-                        f'<div class="insight-item">'
-                        f'<div class="insight-title">{title}</div>{text}'
+                        f'<div class="ss-chart-card">'
+                        f'<div class="ss-chart-title">{title}</div>'
+                        f'<div class="ss-chart-skip-msg">{skip_msg}</div>'
                         f'</div>',
                         unsafe_allow_html=True,
                     )
-
-            if keywords:
-                top_kw = [kw["term"] for kw in keywords[:12]]
-                kwbadges = " ".join(
-                    f'<span style="background:rgba(0,194,255,0.10);color:#7FDBFF;'
-                    f'padding:0.15rem 0.6rem;border-radius:999px;font-size:0.78rem;'
-                    f'margin:2px;display:inline-block;border:1px solid rgba(0,194,255,0.18);">'
-                    f'{kw}</span>'
-                    for kw in top_kw
-                )
-                st.markdown(
-                    f'<div class="text-summary-box"><div class="text-summary-title">🔑 Top Keywords</div>'
-                    f'<div style="padding-top:0.3rem;">{kwbadges}</div></div>',
-                    unsafe_allow_html=True,
-                )
-
-        if not rendered_anything:
-            _empty("💡", "Upload a CSV, Excel, or PDF to see data insights.")
-
-    except Exception as exc:
-        st.error(f"Insights section error: {exc}")
+                else:
+                    st.markdown(
+                        f'<div class="ss-chart-card">',
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown(
+                        f'<div class="ss-chart-title">{title}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    st.plotly_chart(
+                        fig,
+                        width="stretch",
+                        config={"displayModeBar": False},
+                        key=f"chart_{chart_idx}",
+                    )
+                    st.markdown('</div>', unsafe_allow_html=True)
+                chart_idx += 1
+        i += 2
 
 
 # ─────────────────────────────────────────────────────────────────
-# WELCOME STATE
+# STATISTICS TABLE  (collapsible)
 # ─────────────────────────────────────────────────────────────────
 
-def render_welcome() -> None:
+def _render_stats_table(results: dict) -> None:
+    """Render a collapsible descriptive-statistics table for numeric columns.
+
+    Uses ``st.expander`` so it is hidden by default and only expands when
+    the user explicitly clicks it.  Shows count, mean, std, min, median,
+    max, and missing-% for every numeric column in the dataset.
+
+    Parameters
+    ----------
+    results : dict
+        Full orchestrator output dict.
+    """
+    data_results = results.get("data") or {}
+    if not data_results.get("success"):
+        return
+
+    df: pd.DataFrame = data_results.get("dataframe", pd.DataFrame())
+    schema = data_results.get("schema", {})
+    numeric_cols = [c for c in schema.get("numerical", []) if c in df.columns]
+
+    if not numeric_cols or df.empty:
+        return
+
+    with st.expander("📊 Statistics table", expanded=False):
+        num_df = df[numeric_cols]
+
+        # Build a clean stats frame
+        desc = num_df.describe(percentiles=[0.5]).T   # mean, std, min, 50%, max, count
+        desc = desc.rename(columns={
+            "count": "Count",
+            "mean":  "Mean",
+            "std":   "Std dev",
+            "min":   "Min",
+            "50%":   "Median",
+            "max":   "Max",
+        })
+        # Add missing %
+        desc["Missing %"] = (num_df.isna().sum() / len(df) * 100).round(1)
+
+        # Round numbers for readability
+        for col in ["Mean", "Std dev", "Min", "Median", "Max"]:
+            if col in desc.columns:
+                desc[col] = desc[col].apply(
+                    lambda v: f"{v:,.2f}" if abs(v) < 1_000_000 else f"{v:,.0f}"
+                    if pd.notna(v) else "—"
+                )
+        desc["Count"]     = desc["Count"].apply(lambda v: f"{int(v):,}")
+        desc["Missing %"] = desc["Missing %"].apply(lambda v: f"{v:.1f}%")
+
+        # Rename index to "Column"
+        desc.index.name = "Column"
+        desc = desc.reset_index()
+
+        st.dataframe(
+            desc,
+            width="stretch",
+            hide_index=True,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────
+# INSIGHTS LIST
+# ─────────────────────────────────────────────────────────────────
+
+_SOURCE_PILL_KEY = {
+    "data":    "pill_data",
+    "anomaly": "pill_anomaly",
+    "text":    "pill_nlp",
+    "nlp":     "pill_nlp",
+    "fusion":  "pill_fusion",
+}
+
+_SOURCE_DISPLAY = {
+    "data":    "DATA",
+    "anomaly": "ANOMALY",
+    "text":    "NLP",
+    "nlp":     "NLP",
+    "fusion":  "FUSION",
+}
+
+
+def _pill_html(source: str, theme: dict) -> str:
+    """Build the HTML for a source pill badge.
+
+    Parameters
+    ----------
+    source : str
+        Insight source key (``"data"``, ``"anomaly"``, ``"text"``,
+        ``"fusion"``).
+    theme  : dict
+        Active design-token dict.
+
+    Returns
+    -------
+    str
+        HTML ``<span>`` string.
+    """
+    key     = _SOURCE_PILL_KEY.get(source, "pill_default")
+    colours = theme.get(key, theme["pill_default"])
+    label   = _SOURCE_DISPLAY.get(source, source.upper())
+    return (
+        f'<span class="ss-ins-pill" '
+        f'style="background:{colours["bg"]};color:{colours["text"]}">'
+        f'{label}</span>'
+    )
+
+
+def _insight_card_html(ins: dict, theme: dict) -> str:
+    """Build the HTML string for a single insight card.
+
+    No rank badge is rendered.  Order in the list implies rank.
+
+    Parameters
+    ----------
+    ins   : dict   Insight dict (title, description, score, source, evidence).
+    theme : dict   Active design-token dict.
+
+    Returns
+    -------
+    str
+        Complete ``<div class="ss-ins-card">`` HTML string.
+    """
+    title    = ins.get("title", "Insight")
+    desc     = strip_templated_prose(
+        ins.get("description", ins.get("text", ""))
+    )
+    source   = ins.get("source", "data")
+    evidence = ins.get("evidence", [])
+
+    pill     = _pill_html(source, theme)
+
+    ev_html  = ""
+    if evidence:
+        chips = "".join(
+            f'<span class="ss-evidence-chip">{e}</span>'
+            for e in evidence[:5]
+        )
+        ev_html = f'<div class="ss-evidence-row">{chips}</div>'
+
+    return (
+        f'<div class="ss-ins-card">'
+        f'  <div class="ss-ins-top-row">'
+        f'    <div class="ss-ins-title">{title}</div>'
+        f'    {pill}'
+        f'  </div>'
+        f'  <div class="ss-ins-body">{desc}</div>'
+        f'  {ev_html}'
+        f'</div>'
+    )
+
+
+def render_insights_list(results: dict, has_nlp_text_upload: bool) -> None:
+    """Render the stacked insight cards in the Insights section.
+
+    Walks ``results["ranked_insights"]``, converts Insight objects to
+    dicts, strips templated prose, and renders each card with a source
+    pill.  Appends a dashed NLP placeholder card when no text file was
+    uploaded.
+
+    Parameters
+    ----------
+    results              : dict   Full orchestrator output dict.
+    has_nlp_text_upload  : bool   True if a TXT/PDF text file is present.
+    """
     st.markdown(
-        """
-        <div class="empty-state">
-            <div class="empty-state-icon">📂</div>
-            <strong style="color:#E6EDF3;font-size:1.0rem;">No files uploaded yet</strong><br><br>
-            Upload a <strong>CSV or Excel</strong> for structured analytics and charts.<br>
-            Upload a <strong>PDF</strong> — if it contains a table it becomes a full data dashboard.<br>
-            Upload a <strong>TXT or text-only PDF</strong> for extractive document summary.
-        </div>
-        """,
+        '<div class="ss-section-heading">Insights</div>',
         unsafe_allow_html=True,
     )
+
+    theme = get_theme(st.session_state.get("theme", "dark"))
+
+    ranked = results.get("ranked_insights") or []
+    ranked_dicts: list[dict] = []
+    for item in ranked:
+        if isinstance(item, dict):
+            ranked_dicts.append(item)
+        elif hasattr(item, "to_dict"):
+            ranked_dicts.append(item.to_dict())
+
+    if ranked_dicts:
+        cards_html = "".join(
+            _insight_card_html(ins, theme) for ins in ranked_dicts
+        )
+        st.markdown(cards_html, unsafe_allow_html=True)
+    else:
+        # Fallback: try data insights or text summary
+        data_results = results.get("data") or {}
+        text_results = results.get("text") or {}
+        rendered = False
+
+        if data_results.get("success"):
+            for ins in data_results.get("insights", []):
+                text = ins.get("text", ins.get("description", ""))
+                if text:
+                    rendered = True
+                    d = {"title": ins.get("title", ""), "description": text, "source": "data"}
+                    st.markdown(_insight_card_html(d, theme), unsafe_allow_html=True)
+
+        if text_results.get("success"):
+            summary = text_results.get("analysis", {}).get("summary", "").strip()
+            if summary:
+                rendered = True
+                d = {"title": "Document Summary", "description": summary, "source": "text"}
+                st.markdown(_insight_card_html(d, theme), unsafe_allow_html=True)
+
+        if not rendered:
+            _empty_state("💡", "No insights yet",
+                         "Upload a CSV, Excel, or PDF to see insights.")
+            return
+
+    # ── NLP placeholder card (CSV-only upload) ─────────────────────
+    if not has_nlp_text_upload:
+        st.markdown(
+            '<div class="ss-nlp-placeholder">'
+            '<div class="ss-nlp-placeholder-title">More insights available</div>'
+            '<div class="ss-nlp-placeholder-body">'
+            'Upload a TXT or text-bearing PDF to see NLP keywords, '
+            'summaries, and cross-modal fusion insights.'
+            '</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────
+# DASHBOARD  (file uploaded)
+# ─────────────────────────────────────────────────────────────────
+
+def render_dashboard(
+    theme: dict,
+    results: dict,
+    has_nlp_text_upload: bool,
+) -> None:
+    """Render the full dashboard after file upload.
+
+    Parameters
+    ----------
+    theme               : dict   Active design-token dict.
+    results             : dict   Orchestrator output dict.
+    has_nlp_text_upload : bool   True if a text file was uploaded.
+    """
+    # top bar removed — sidebar wordmark + toggle is sufficient
+    # Surface pipeline errors / warnings
+    for err in results.get("errors", []):
+        st.error(err)
+    for warn in results.get("warnings", []):
+        st.warning(warn)
+
+    # ── Section 1: Overview ────────────────────────────────────────
+    st.markdown(
+        '<div class="ss-section-heading">Overview</div>',
+        unsafe_allow_html=True,
+    )
+    render_kpi_row(results)
+
+    # ── Section 2: Charts ──────────────────────────────────────────
+    render_charts_grid(results, theme)
+
+    # ── Section 2b: Statistics table (collapsible) ──────────────────────
+    _render_stats_table(results)
+
+    # ── Section 3: Insights ────────────────────────────────────────
+    render_insights_list(results, has_nlp_text_upload)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -970,100 +1370,43 @@ def render_welcome() -> None:
 # ─────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    inject_styles()
+    """Application entry point.
 
-    # ── Header ──
-    st.markdown(
-        """
-        <div style="padding:1.2rem 0 0.5rem;">
-            <div style="color:#00C2FF;font-size:0.72rem;letter-spacing:0.16em;text-transform:uppercase;font-weight:700;margin-bottom:0.3rem;">Analytics Dashboard</div>
-            <div style="font-size:2.0rem;font-weight:800;color:#E6EDF3;line-height:1.1;margin-bottom:0.4rem;">Smart Summariser</div>
-            <div style="color:#8B98A5;font-size:0.93rem;line-height:1.65;">Upload CSV, Excel, or PDF — get instant structured summaries, charts, and insights.</div>
-            <hr style="border:none;border-top:1px solid rgba(255,255,255,0.07);margin:1.1rem 0 0.2rem;">
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    Initialises session state, injects CSS, renders sidebar, then
+    branches to the landing screen (no upload) or the dashboard.
+    """
+    # ── Session state defaults ─────────────────────────────────────
+    if "theme" not in st.session_state:
+        st.session_state["theme"] = "dark"
 
-    # ── Sidebar ──
-    with st.sidebar:
-        st.markdown("### 📂 Upload Files")
-        uploaded_files = st.file_uploader(
-            "CSV, Excel, PDF, or TXT",
-            type=["csv", "xlsx", "xls", "pdf", "txt"],
-            accept_multiple_files=True,
-            help="PDF files with embedded tables will be treated as structured data.",
-        )
+    theme = get_theme(st.session_state["theme"])
+    inject_global_css(theme)
 
-        st.markdown("---")
-        insight_depth = st.slider(
-            "⚙️ Insight depth",
-            min_value=1, max_value=5, value=3,
-            help="Higher = more detailed insights.",
-        )
+    # ── Sidebar ────────────────────────────────────────────────────
+    insight_depth, selected_columns, uploaded_files = render_sidebar(theme)
 
-        payloads     = serialise_uploads(uploaded_files) if uploaded_files else tuple()
-        preview_cols = preview_structured_columns(payloads) if payloads else []
-        default_cols = preview_cols[: min(6, len(preview_cols))] if len(preview_cols) > 6 else preview_cols
-
-        if preview_cols:
-            st.markdown("---")
-            selected_columns = st.multiselect(
-                "🔬 Columns to analyse",
-                options=preview_cols,
-                default=default_cols,
-            )
-        else:
-            selected_columns = []
-
-        if SAMPLE_DATA_PATH.exists():
-            st.markdown("---")
-            st.caption(f"💡 Sample: `{SAMPLE_DATA_PATH.name}`")
-
-    # ── No files ──
+    # ── Branch ────────────────────────────────────────────────────
     if not uploaded_files:
-        render_welcome()
+        render_landing(theme)
         return
 
-    text_detected = contains_text_payloads(payloads)
+    # ── Analysis ──────────────────────────────────────────────────
+    payloads          = serialise_uploads(uploaded_files)
+    preview_cols      = preview_structured_columns(payloads)
+    has_nlp           = contains_text_payloads(payloads)
+    active_columns    = tuple(selected_columns or preview_cols)
 
-    if text_detected:
+    if has_nlp:
         with st.spinner("Preparing NLP resources…"):
             try:
                 prepare_nlp_resources()
             except Exception:
                 pass
 
-    active_columns = tuple(selected_columns or preview_cols)
-
     with st.spinner("Analysing your files…"):
-        results = run_cached_analysis(payloads, insight_depth, active_columns, text_detected)
+        results = run_cached_analysis(payloads, insight_depth, active_columns, has_nlp)
 
-    # Surface errors / warnings
-    for err in results.get("errors", []):
-        st.error(err)
-    for warn in results.get("warnings", []):
-        st.warning(warn)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # ══ SECTION 1: SUMMARY KPIs ══
-    render_summary_section(results)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # ══ SECTION 2: STRUCTURED DATA SUMMARY ══
-    render_structured_summary_section(results)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # ══ SECTION 3: CHARTS ══
-    render_charts_section(results)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # ══ SECTION 4: INSIGHTS ══
-    render_insights_section(results)
+    render_dashboard(theme, results, has_nlp_text_upload=has_nlp)
 
 
 if __name__ == "__main__":

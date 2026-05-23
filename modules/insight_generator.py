@@ -461,26 +461,28 @@ def generate_text_insights(
             ))
 
         # ── Named entity insight ───────────────────────────────────
-        if entities:
-            grouped: dict = defaultdict(list)
-            for entity in entities[:15]:
-                grouped[entity["label"]].append(
-                    f"{entity['text']} (×{entity['count']})"
-                )
+        # entities is dict[str, list[dict]] keyed by category
+        if entities and any(entities.values()):
             entity_summary_parts = []
-            for label, items in list(grouped.items())[:4]:
+            total_entity_count = 0
+            for label, items in entities.items():
+                if not items:
+                    continue
+                total_entity_count += len(items)
                 entity_summary_parts.append(
-                    f"{label}: {_top_items(items, 3)}"
+                    f"{label}: {_top_items([f'{e['text']} (×{e['count']})' for e in items], 3)}"
                 )
             description = (
-                f"Named entity recognition identified {len(entities)} distinct entities. "
+                f"Named entity recognition identified {total_entity_count} distinct entities "
+                f"across {len(entity_summary_parts)} categories. "
                 f"Coverage: {' | '.join(entity_summary_parts)}. "
                 f"High entity density in a specific category may indicate the document "
                 f"is domain-specific reporting (e.g. financial, geographic, organisational)."
             )
             evidence = [
                 f"{label}: {len(items)} entity/entities"
-                for label, items in grouped.items()
+                for label, items in entities.items()
+                if items
             ]
             insights.append(Insight(
                 title="Named Entities",
