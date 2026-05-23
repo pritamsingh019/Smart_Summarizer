@@ -2,7 +2,7 @@
 
 ## Overview
 
-Smart Summariser is a fully **offline** Streamlit-based intelligence dashboard that accepts CSV, Excel, PDF, and TXT files and produces structured summaries, interactive charts, and **ranked AI insights** — without any cloud API, external AI service, or internet connection after the first setup.
+Smart Summarizer is a fully **offline** Streamlit-based intelligence dashboard that accepts CSV, Excel, PDF, and TXT files and produces structured summaries, interactive charts, and **ranked AI insights** — without any cloud API, external AI service, or internet connection after the first setup.
 
 For structured files (CSV, Excel, or PDFs containing embedded tables), it runs a full data analytics pipeline: schema detection, statistical analysis, anomaly detection (Z-score + Isolation Forest), trend analysis, and chart generation. For text-only files (TXT or text-layer PDFs), it runs an NLP pipeline: sentence segmentation, TF-IDF keyword extraction with importance scoring, extractive summarisation via TextRank, and named-entity recognition via spaCy.
 
